@@ -1,0 +1,31 @@
+[package]
+name = "nixgamehax4steam"
+version = "0.1.0"
+edition = "2021"
+description = "CheatEngine-style Memory Editor for Steam/Proton Games on Linux"
+authors = ["Daniel"]
+license = "MIT"
+
+[[bin]]
+name = "nixgamehax4steam"
+path = "src/cli.rs"
+
+[[bin]]
+name = "nixgamehax4steam-gui"
+path = "src/gui.rs"
+
+[lib]
+name = "nixgamehax4steam"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
+anyhow = "1"
+hex = "0.4"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# GUI — egui with native backend
+egui = "0.33"
+eframe = { version = "0.33", features = ["default"] }
