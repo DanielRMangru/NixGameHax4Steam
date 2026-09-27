@@ -68,16 +68,41 @@ RESULTS LIST
   🔒 Lock All     Freeze every result in one click (≤100 results).
 
 ──────────────────────────────────────────────────────
+VALIDATOR & MEMORY DIAGNOSTICS
+──────────────────────────────────────────────────────
+  Why did locked values not change an in-game purchase?
+  Modern games employ several protection/caching layers:
+
+  🟢 Stable (Local)
+     The value holds in memory with 0% resistance. Direct
+     writes and freezes work immediately (standard offline games).
+
+  🟡 UI Display Cache
+     The game overwrites this address rapidly every frame.
+     This indicates you locked a visual HUD/text buffer rather
+     than the true underlying game balance.
+     → Search while switching menus or trace parent pointers.
+
+  🔴 Reverted on Action / Purchase
+     The value held steady while idle, but snapped back when
+     making an in-game purchase. This indicates:
+     1. Server-Side Validation (e.g. 2K VC / online microtransactions)
+     2. Dual-Storage / Shadow checksum verification
+     → Use the "Scan Nearby Shadows" tool to locate mirrored values.
+
+  🟣 Dynamic Heap / Anon Memory
+     Address is located in dynamic heap memory. Pointers may
+     change if you reload scenes or restart the game.
+
+──────────────────────────────────────────────────────
 LOCKED VALUES TABLE
 ──────────────────────────────────────────────────────
   ☑ checkbox    Enable/disable the freeze for that entry.
   Address       Click to jump to it in the Read/Write panel.
   Frozen        The value that gets re-written every frame.
   Live          The value actually in memory right now.
-    🟢 Green  = freeze is holding (game hasn't overwritten it yet).
-    🟡 Yellow = game wrote a different value between frames;
-               the next frame will re-apply the frozen value.
-  ❌ button    Remove this entry from the locked list.
+  Diagnosis     Live validator badge & stability indicator.
+  ❌ button     Remove this entry from the locked list.
 
 ──────────────────────────────────────────────────────
 READ / WRITE PANEL
@@ -87,6 +112,9 @@ READ / WRITE PANEL
   🔒 Lock         Locks the *current New value* field — NOT the
                   Current value. Edit New value first if you want
                   to freeze a specific number (e.g. 9999 gold).
+  Diagnostics     Inspects memory region type (Module vs Heap),
+                  monitors write stability, and scans for nearby
+                  shadow/mirrored values.
 
 ──────────────────────────────────────────────────────
 SCAN BUTTONS
@@ -137,6 +165,71 @@ enum ScanMsg {
 /// Size of the hex dump window around a selected address.
 const HEX_WINDOW_BYTES: usize = 4096;
 
+/// Diagnostic state evaluated for a locked memory value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidatorDiagnosis {
+    /// Holds stably without pushback from the game.
+    Stable,
+    /// Constantly overwritten every frame -> UI/HUD display render cache.
+    UiDisplayCache,
+    /// Held the value while idle, but rejected/reverted when a game transaction/action occurred.
+    TransactionRejection,
+    /// Dynamic heap memory (could reallocate or change across scenes).
+    DynamicHeap,
+    /// Unknown / Still evaluating.
+    Evaluating,
+}
+
+impl ValidatorDiagnosis {
+    pub fn badge(&self) -> (&'static str, egui::Color32, &'static str) {
+        match self {
+            ValidatorDiagnosis::Stable => (
+                "🟢 Stable",
+                egui::Color32::from_rgb(80, 220, 100),
+                "Value holds stably without pushback from game. Standard local variable.",
+            ),
+            ValidatorDiagnosis::UiDisplayCache => (
+                "🟡 UI Cache",
+                egui::Color32::from_rgb(255, 210, 60),
+                "Constantly overwritten every frame. You may have found a HUD/UI display buffer rather than the true variable.",
+            ),
+            ValidatorDiagnosis::TransactionRejection => (
+                "🔴 Reverted on Action",
+                egui::Color32::from_rgb(255, 90, 90),
+                "Value held while idle, but snapped back upon making an in-game action/purchase. Server-side validation or shadow checksum detected.",
+            ),
+            ValidatorDiagnosis::DynamicHeap => (
+                "🟣 Dynamic Heap",
+                egui::Color32::from_rgb(200, 140, 255),
+                "Address is inside dynamic heap/anon memory. Pointers may change on scene transitions.",
+            ),
+            ValidatorDiagnosis::Evaluating => (
+                "⚪ Evaluating...",
+                egui::Color32::from_rgb(180, 180, 180),
+                "Monitoring memory write/read stability...",
+            ),
+        }
+    }
+}
+
+/// Memory region categorization for an address.
+#[derive(Debug, Clone)]
+pub struct RegionDiagnosis {
+    pub name: String,
+    pub detail: String,
+    pub color: egui::Color32,
+    pub is_static: bool,
+}
+
+/// Result of scanning proximity memory for potential shadow/mirrored values.
+#[derive(Debug, Clone)]
+pub struct ShadowScanResult {
+    pub offset_bytes: i64,
+    pub address: u64,
+    pub description: String,
+    pub value_str: String,
+}
+
 /// A locked (frozen) memory value.
 struct LockedEntry {
     address: u64,
@@ -144,6 +237,29 @@ struct LockedEntry {
     bytes: Vec<u8>,
     enabled: bool,
     label: String,
+    // Diagnostics metrics
+    writes_total: u64,
+    drift_count: u64,
+    held_streak: usize,
+    drift_streak: usize,
+    diagnosis: ValidatorDiagnosis,
+}
+
+impl LockedEntry {
+    fn new(address: u64, value_type: ValueType, bytes: Vec<u8>, label: String) -> Self {
+        Self {
+            address,
+            value_type,
+            bytes,
+            enabled: true,
+            label,
+            writes_total: 0,
+            drift_count: 0,
+            held_streak: 0,
+            drift_streak: 0,
+            diagnosis: ValidatorDiagnosis::Evaluating,
+        }
+    }
 }
 
 /// Our main GUI state.
@@ -179,6 +295,8 @@ pub struct ProtonMemApp {
     selected_results: HashSet<u64>,
     /// Whether the Help window is open.
     show_help: bool,
+    /// Proximity shadow scan candidates found in memory window around selected_address.
+    shadow_scan_results: Option<Vec<ShadowScanResult>>,
 }
 
 impl Default for ProtonMemApp {
@@ -207,6 +325,7 @@ impl Default for ProtonMemApp {
             _pending_next_history: None,
             selected_results: HashSet::new(),
             show_help: false,
+            shadow_scan_results: None,
         }
     }
 }
@@ -482,17 +601,21 @@ impl ProtonMemApp {
                 entry.bytes = bytes.clone();
                 entry.value_type = self.scan_value_type;
                 entry.enabled = true;
+                entry.writes_total = 0;
+                entry.drift_count = 0;
+                entry.held_streak = 0;
+                entry.drift_streak = 0;
+                entry.diagnosis = ValidatorDiagnosis::Evaluating;
                 self.status_message = format!("Locked {:#x} at {}", self.selected_address, self.rw_value_text);
                 return;
             }
         }
-        self.locked_values.push(LockedEntry {
-            address: self.selected_address,
-            value_type: self.scan_value_type,
-            bytes: bytes.clone(),
-            enabled: true,
-            label: format!("{:#x}", self.selected_address),
-        });
+        self.locked_values.push(LockedEntry::new(
+            self.selected_address,
+            self.scan_value_type,
+            bytes.clone(),
+            format!("{:#x}", self.selected_address),
+        ));
         self.status_message = format!(
             "Locked {} at {:#x}",
             self.rw_value_text,
@@ -507,18 +630,212 @@ impl ProtonMemApp {
         }
     }
 
-    /// Write all enabled locked values to the target process.
+    /// Write all enabled locked values to the target process and update stability diagnostics.
     fn write_locked_values(&mut self) {
         let handle = match self.handle.as_ref() {
             Some(h) => h,
             None => return,
         };
-        for entry in &self.locked_values {
+        for entry in &mut self.locked_values {
             if !entry.enabled {
                 continue;
             }
+
+            // Diagnostic pre-read: check if game engine has overwritten the value since last frame
+            if let Ok(live_bytes) = handle.read(entry.address, entry.bytes.len()) {
+                entry.writes_total = entry.writes_total.saturating_add(1);
+                if live_bytes != entry.bytes {
+                    entry.drift_count = entry.drift_count.saturating_add(1);
+                    entry.drift_streak = entry.drift_streak.saturating_add(1);
+
+                    // If it held steady for >=12 frames (idle stability), but then drifted,
+                    // an in-game action (purchase/damage/scene change) triggered a rollback/validator.
+                    if entry.held_streak >= 12 && entry.drift_streak >= 1 {
+                        entry.diagnosis = ValidatorDiagnosis::TransactionRejection;
+                    } else if entry.drift_count >= 5
+                        && (entry.drift_count as f64 / entry.writes_total as f64) > 0.35
+                    {
+                        // Rapid continuous frame-by-frame overwrite -> UI render display buffer
+                        entry.diagnosis = ValidatorDiagnosis::UiDisplayCache;
+                    }
+                    entry.held_streak = 0;
+                } else {
+                    entry.held_streak = entry.held_streak.saturating_add(1);
+                    entry.drift_streak = 0;
+
+                    // If steady for >20 frames and not flagged as transaction rollback, it is stable local memory
+                    if entry.held_streak >= 20 && entry.diagnosis != ValidatorDiagnosis::TransactionRejection {
+                        entry.diagnosis = ValidatorDiagnosis::Stable;
+                    }
+                }
+            }
+
             let _ = handle.write(entry.address, &entry.bytes);
         }
+    }
+
+    /// Look up the memory region for an address and categorize it.
+    fn get_region_diagnosis(&self, addr: u64) -> RegionDiagnosis {
+        if addr == 0 {
+            return RegionDiagnosis {
+                name: "None".into(),
+                detail: "No address selected".into(),
+                color: egui::Color32::GRAY,
+                is_static: false,
+            };
+        }
+        if let Some(ref map) = self.memory_map {
+            if let Some(region) = map.region_for_addr(addr) {
+                let offset_in_region = addr.saturating_sub(region.start);
+                let path = &region.path;
+
+                if path.ends_with(".exe") || path.contains(".exe") {
+                    let file_name = std::path::Path::new(path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(path);
+                    return RegionDiagnosis {
+                        name: format!("Static Module: {} + {:#X}", file_name, offset_in_region),
+                        detail: format!("Range: {:#X}..{:#X} | Perms: {}", region.start, region.end, region.perms),
+                        color: egui::Color32::from_rgb(90, 220, 110),
+                        is_static: true,
+                    };
+                } else if path.ends_with(".dll") || path.ends_with(".so") || path.contains(".dll") || path.contains(".so") {
+                    let file_name = std::path::Path::new(path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(path);
+                    return RegionDiagnosis {
+                        name: format!("Shared Lib: {} + {:#X}", file_name, offset_in_region),
+                        detail: format!("Range: {:#X}..{:#X} | Perms: {}", region.start, region.end, region.perms),
+                        color: egui::Color32::from_rgb(110, 190, 255),
+                        is_static: true,
+                    };
+                } else if path == "[heap]" {
+                    return RegionDiagnosis {
+                        name: format!("[heap] + {:#X} (Dynamic Heap)", offset_in_region),
+                        detail: format!("Range: {:#X}..{:#X} | Perms: {} (Dynamic Allocation)", region.start, region.end, region.perms),
+                        color: egui::Color32::from_rgb(255, 180, 70),
+                        is_static: false,
+                    };
+                } else if path.starts_with("[stack") {
+                    return RegionDiagnosis {
+                        name: format!("[stack] + {:#X} (Thread Stack)", offset_in_region),
+                        detail: format!("Range: {:#X}..{:#X} | Perms: {}", region.start, region.end, region.perms),
+                        color: egui::Color32::from_rgb(100, 240, 240),
+                        is_static: false,
+                    };
+                } else if path.is_empty() {
+                    return RegionDiagnosis {
+                        name: format!("Anonymous mmap + {:#X} (Proton Dynamic Heap)", offset_in_region),
+                        detail: format!("Range: {:#X}..{:#X} | Perms: {} (Heap memory)", region.start, region.end, region.perms),
+                        color: egui::Color32::from_rgb(200, 140, 255),
+                        is_static: false,
+                    };
+                } else {
+                    return RegionDiagnosis {
+                        name: format!("{} + {:#X}", path, offset_in_region),
+                        detail: format!("Range: {:#X}..{:#X} | Perms: {}", region.start, region.end, region.perms),
+                        color: egui::Color32::LIGHT_GRAY,
+                        is_static: false,
+                    };
+                }
+            }
+        }
+        RegionDiagnosis {
+            name: "Unmapped / Unknown Region".into(),
+            detail: "Address not found in /proc/[pid]/maps".into(),
+            color: egui::Color32::GRAY,
+            is_static: false,
+        }
+    }
+
+    /// Scan surrounding hex window memory for candidate shadow / mirrored variables.
+    fn scan_proximity_shadows(&mut self) {
+        if self.selected_address == 0 || self.hex_buf.is_empty() {
+            self.shadow_scan_results = None;
+            return;
+        }
+        let start_addr = (self.selected_address / 16) * 16;
+        let vt = self.scan_value_type;
+        let mut results = Vec::new();
+
+        let target_bytes = match self.handle.as_ref().and_then(|h| {
+            let size = match vt {
+                ValueType::U8 => 1,
+                ValueType::U16 => 2,
+                ValueType::U32 => 4,
+                ValueType::U64 => 8,
+                ValueType::F32 => 4,
+                ValueType::F64 => 8,
+                _ => 4,
+            };
+            h.read(self.selected_address, size).ok()
+        }) {
+            Some(b) => b,
+            None => {
+                self.shadow_scan_results = Some(Vec::new());
+                return;
+            }
+        };
+
+        if target_bytes.iter().all(|&b| b == 0) {
+            self.shadow_scan_results = Some(Vec::new());
+            return;
+        }
+
+        let step = match vt {
+            ValueType::U8 => 1,
+            ValueType::U16 => 2,
+            ValueType::U32 | ValueType::F32 => 4,
+            ValueType::U64 | ValueType::F64 => 8,
+            _ => 1,
+        };
+
+        let target_offset_in_buf = self.selected_address.saturating_sub(start_addr) as usize;
+
+        // Check for exact matching values at other nearby offsets (Dual-Storage / Mirrored variables)
+        let mut idx = 0;
+        while idx + target_bytes.len() <= self.hex_buf.len() {
+            if idx != target_offset_in_buf && self.hex_buf[idx..idx + target_bytes.len()] == target_bytes[..] {
+                let candidate_addr = start_addr + idx as u64;
+                let rel_offset = candidate_addr as i64 - self.selected_address as i64;
+                results.push(ShadowScanResult {
+                    offset_bytes: rel_offset,
+                    address: candidate_addr,
+                    description: "Exact Mirror Value (Dual-Storage Candidate)".into(),
+                    value_str: fmt_bytes_as_value(&target_bytes, vt),
+                });
+                if results.len() >= 12 {
+                    break;
+                }
+            }
+            idx += step;
+        }
+
+        // Also check if an integer has a float mirror
+        if vt == ValueType::U32 && target_bytes.len() == 4 {
+            let int_val = u32::from_le_bytes([target_bytes[0], target_bytes[1], target_bytes[2], target_bytes[3]]);
+            if int_val > 0 && int_val < 100_000_000 {
+                let float_bytes = (int_val as f32).to_le_bytes();
+                let mut f_idx = 0;
+                while f_idx + 4 <= self.hex_buf.len() && results.len() < 12 {
+                    if f_idx != target_offset_in_buf && self.hex_buf[f_idx..f_idx + 4] == float_bytes {
+                        let candidate_addr = start_addr + f_idx as u64;
+                        let rel_offset = candidate_addr as i64 - self.selected_address as i64;
+                        results.push(ShadowScanResult {
+                            offset_bytes: rel_offset,
+                            address: candidate_addr,
+                            description: "Float Mirror (F32 representation of int)".into(),
+                            value_str: format!("{:.1}", int_val as f32),
+                        });
+                    }
+                    f_idx += 4;
+                }
+            }
+        }
+
+        self.shadow_scan_results = Some(results);
     }
 
     fn new_scan(&mut self) {
@@ -1249,13 +1566,12 @@ impl eframe::App for ProtonMemApp {
                                 let bytes = live_bytes.unwrap_or_else(|| vec![0u8; sr.size]);
                                 // Avoid duplicates.
                                 if !self.locked_values.iter().any(|e| e.address == sr.address) {
-                                    self.locked_values.push(LockedEntry {
-                                        address: sr.address,
-                                        value_type: sr.value_type,
-                                        bytes: bytes.clone(),
-                                        enabled: true,
-                                        label: format!("{:#x}", sr.address),
-                                    });
+                                    self.locked_values.push(LockedEntry::new(
+                                        sr.address,
+                                        sr.value_type,
+                                        bytes.clone(),
+                                        format!("{:#x}", sr.address),
+                                    ));
                                 }
                             }
                             self.status_message = format!("Locked {} addresses.", all_to_lock.len());
@@ -1317,13 +1633,12 @@ impl eframe::App for ProtonMemApp {
                                     let bytes = self.handle.as_ref()
                                         .and_then(|h| h.read(sr_clone.address, sr_clone.size).ok())
                                         .unwrap_or_else(|| vec![0u8; sr_clone.size]);
-                                    self.locked_values.push(LockedEntry {
-                                        address: addr,
-                                        value_type: sr_clone.value_type,
+                                    self.locked_values.push(LockedEntry::new(
+                                        addr,
+                                        sr_clone.value_type,
                                         bytes,
-                                        enabled: true,
-                                        label: format!("{:#x}", addr),
-                                    });
+                                        format!("{:#x}", addr),
+                                    ));
                                     self.status_message = format!("Locked {:#x}", addr);
                                 }
                             });
@@ -1397,26 +1712,31 @@ impl eframe::App for ProtonMemApp {
             ui.separator();
             ui.add_space(5.0);
 
-            // ----- Read / Write Panel -----
-            ui.heading("Read / Write");
+            // ----- Read / Write Panel & Validator Diagnostics -----
+            ui.heading("Read / Write & Memory Diagnostics");
             ui.separator();
 
             if self.selected_address == 0 {
-                ui.label("Select an address from the results list to view and edit its value.");
+                ui.label("Select an address from the results list to view its memory region and live diagnostics.");
             } else {
+                let region_diag = self.get_region_diagnosis(self.selected_address);
+
+                // Address + Region badge
                 ui.horizontal(|ui| {
                     ui.label(format!("Address: {:#x}", self.selected_address));
                     ui.label(format!("Type: {:?}", self.scan_value_type));
+                    ui.colored_label(region_diag.color, egui::RichText::new(&region_diag.name).strong().small());
                 });
 
+                ui.label(egui::RichText::new(&region_diag.detail).small().weak());
                 ui.add_space(4.0);
 
                 ui.horizontal(|ui| {
                     ui.label("Current value:");
-                    ui.label(egui::RichText::new(&self.rw_value_text).monospace());
+                    ui.label(egui::RichText::new(&self.rw_value_text).monospace().strong());
                 });
 
-                ui.add_space(4.0);
+                ui.add_space(2.0);
 
                 ui.horizontal(|ui| {
                     ui.label("New value:");
@@ -1424,29 +1744,123 @@ impl eframe::App for ProtonMemApp {
                     if ui.button("Write").clicked() {
                         self.write_value();
                     }
+                    if ui.button("🔒 Lock").clicked() {
+                        self.lock_current();
+                    }
                 });
 
                 // Show last write result prominently
                 if let Some(ref result) = self.last_write_result {
-                    ui.add_space(4.0);
                     let color = if result.starts_with("✅") {
                         egui::Color32::GREEN
                     } else {
                         egui::Color32::RED
                     };
-                    ui.label(egui::RichText::new(result).color(color).strong());
+                    ui.label(egui::RichText::new(result).color(color).strong().small());
                 }
 
-                // ----- Lock / Freeze functionality -----
                 ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(4.0);
 
-                ui.horizontal(|ui| {
-                    if ui.button("🔒 Lock").clicked() {
-                        self.lock_current();
+                // ----- Real-time Validator & Protection Diagnostics Box -----
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong("🛡️ Validator & Stability Analysis:");
+                        let locked_opt = self.locked_values.iter().find(|e| e.address == self.selected_address);
+                        if let Some(entry) = locked_opt {
+                            let (badge_str, color, tip) = entry.diagnosis.badge();
+                            ui.colored_label(color, egui::RichText::new(badge_str).strong())
+                                .on_hover_text(tip);
+                        } else {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(180, 180, 180),
+                                "⚪ Not Locked (Lock to monitor resistance)",
+                            );
+                        }
+                    });
+
+                    if let Some(entry) = self.locked_values.iter().find(|e| e.address == self.selected_address) {
+                        let drift_pct = if entry.writes_total > 0 {
+                            (entry.drift_count as f64 * 100.0) / entry.writes_total as f64
+                        } else {
+                            0.0
+                        };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Frame writes: {}  |  Overwrites (engine drift): {} ({:.1}%)",
+                                entry.writes_total, entry.drift_count, drift_pct
+                            ))
+                            .small()
+                            .weak(),
+                        );
+
+                        // Guidance box based on detected behavior
+                        match entry.diagnosis {
+                            ValidatorDiagnosis::TransactionRejection => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(255, 120, 120),
+                                    "⚠️ Transaction Rejection / Rollback Detected:\n\
+                                     The value stayed frozen while idle, but snapped back when an in-game purchase or action occurred.\n\
+                                     • If this is Virtual Currency (VC): 2K validates it via online servers.\n\
+                                     • If this is offline currency: The game employs a shadow/dual-storage integrity check.",
+                                );
+                            }
+                            ValidatorDiagnosis::UiDisplayCache => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(255, 210, 80),
+                                    "⚠️ High-Frequency Engine Pushback (UI Cache):\n\
+                                     The game continuously overwrites this address every render frame. You have likely locked the HUD/text display buffer rather than the true variable.",
+                                );
+                            }
+                            ValidatorDiagnosis::Stable => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(100, 230, 120),
+                                    "✅ Local Authority Confirmed: Value holds without resistance. Direct writes take effect.",
+                                );
+                            }
+                            _ => {}
+                        }
                     }
-                    ui.small("(Freezes this value — rewrites every frame)");
+
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("🔎 Scan Proximity for Shadows / Dual-Storage").clicked() {
+                            self.scan_proximity_shadows();
+                        }
+                        if self.shadow_scan_results.is_some() {
+                            if ui.small_button("Clear").clicked() {
+                                self.shadow_scan_results = None;
+                            }
+                        }
+                    });
+
+                    let mut to_select_shadow: Option<u64> = None;
+                    if let Some(ref shadows) = self.shadow_scan_results {
+                        if shadows.is_empty() {
+                            ui.small("No mirrored values found within ±2KB memory window.");
+                        } else {
+                            ui.label(egui::RichText::new(format!("Found {} potential shadow/mirror candidates:", shadows.len())).strong().small());
+                            for cand in shadows {
+                                ui.horizontal(|ui| {
+                                    let offset_str = if cand.offset_bytes >= 0 {
+                                        format!("+{:#X}", cand.offset_bytes)
+                                    } else {
+                                        format!("-{:#X}", -cand.offset_bytes)
+                                    };
+                                    ui.label(egui::RichText::new(format!("{:#X} ({})", cand.address, offset_str)).monospace().small());
+                                    ui.label(egui::RichText::new(&cand.value_str).monospace().small().color(egui::Color32::YELLOW));
+                                    ui.label(egui::RichText::new(&cand.description).small().weak());
+                                    if ui.small_button("Select").clicked() {
+                                        to_select_shadow = Some(cand.address);
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    if let Some(addr) = to_select_shadow {
+                        self.selected_address = addr;
+                        self.load_hex_view();
+                        self.refresh_read_write();
+                    }
                 });
             }
 
@@ -1455,7 +1869,7 @@ impl eframe::App for ProtonMemApp {
                 ui.add_space(8.0);
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.heading("Locked Values");
+                    ui.heading("Locked Values & Validator Status");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let any_disabled = self.locked_values.iter().any(|e| !e.enabled);
                         if any_disabled {
@@ -1474,10 +1888,11 @@ impl eframe::App for ProtonMemApp {
                 // Table header
                 ui.horizontal(|ui| {
                     ui.add_sized([16.0,  16.0], egui::Label::new(egui::RichText::new("En").strong().small()));
-                    ui.add_sized([130.0, 16.0], egui::Label::new(egui::RichText::new("Address").strong().small()));
-                    ui.add_sized([80.0,  16.0], egui::Label::new(egui::RichText::new("Frozen (edit)").strong().small()));
-                    ui.add_sized([80.0,  16.0], egui::Label::new(egui::RichText::new("Live").strong().small()));
-                    ui.add_sized([50.0,  16.0], egui::Label::new(egui::RichText::new("Type").strong().small()));
+                    ui.add_sized([120.0, 16.0], egui::Label::new(egui::RichText::new("Address").strong().small()));
+                    ui.add_sized([75.0,  16.0], egui::Label::new(egui::RichText::new("Frozen").strong().small()));
+                    ui.add_sized([75.0,  16.0], egui::Label::new(egui::RichText::new("Live").strong().small()));
+                    ui.add_sized([45.0,  16.0], egui::Label::new(egui::RichText::new("Type").strong().small()));
+                    ui.add_sized([150.0, 16.0], egui::Label::new(egui::RichText::new("Validator Status").strong().small()));
                 });
                 ui.separator();
 
@@ -1505,10 +1920,12 @@ impl eframe::App for ProtonMemApp {
                                 egui::Color32::YELLOW
                             };
 
+                            let (badge_text, badge_color, badge_tip) = entry.diagnosis.badge();
+
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut entry.enabled, "");
                                 // Address — click to select in RW panel
-                                if ui.add_sized([130.0, 18.0],
+                                if ui.add_sized([120.0, 18.0],
                                     egui::Button::new(
                                         egui::RichText::new(&entry.label).monospace().small()
                                     ).small()
@@ -1517,7 +1934,7 @@ impl eframe::App for ProtonMemApp {
                                 }
                                 // Editable Frozen value field
                                 let edit_resp = ui.add_sized(
-                                    [80.0, 18.0],
+                                    [75.0, 18.0],
                                     egui::TextEdit::singleline(&mut frozen_str).font(egui::TextStyle::Monospace).margin(egui::vec2(2.0, 1.0))
                                 );
                                 if edit_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -1527,7 +1944,7 @@ impl eframe::App for ProtonMemApp {
                                     }
                                 }
                                 // Live value (green = freeze holding, yellow = drifted)
-                                ui.add_sized([80.0, 18.0],
+                                ui.add_sized([75.0, 18.0],
                                     egui::Label::new(
                                         egui::RichText::new(&live_str)
                                             .monospace()
@@ -1536,11 +1953,18 @@ impl eframe::App for ProtonMemApp {
                                     )
                                 );
                                 // Type
-                                ui.add_sized([50.0, 18.0],
+                                ui.add_sized([45.0, 18.0],
                                     egui::Label::new(
                                         egui::RichText::new(format!("{:?}", entry.value_type)).small()
                                     )
                                 );
+                                // Validator Diagnosis Badge with tooltip
+                                ui.add_sized([150.0, 18.0],
+                                    egui::Label::new(
+                                        egui::RichText::new(badge_text).color(badge_color).small().strong()
+                                    )
+                                ).on_hover_text(badge_tip);
+
                                 // Remove
                                 if ui.small_button("❌").clicked() {
                                     to_unlock.push(i);

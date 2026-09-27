@@ -9,12 +9,28 @@ A high-performance, CheatEngine-style memory editor & scanner built in Rust for 
 - ⚡ **Multi-Threaded Memory Scanning:** Background worker thread handles scanning with live progress bar reporting and zero UI freezing.
 - 🎯 **Advanced Value Scanner:** Full support for `U8`, `U16`, `U32`, `U64`, `F32` (floats), `F64` (doubles), `Hex`, and raw `Bytes`.
 - 🔄 **Incremental Next Scan & Undo:** Quickly narrow down millions of candidate addresses with multi-pass scans and undo history.
-- 🔒 **Active Freeze & Memory Locking:** Continuous multi-address locking loop re-applies values every frame to prevent game engine drift, with live vs. frozen status indicators (🟢 Holding / 🟡 Drifted).
+- 🛡️ **Live Validator & Stability Diagnostics:** Real-time analysis of lock stability to diagnose why in-game values don't stick (detects HUD/UI render caches, server-side rollbacks, and shadow variable integrity checks).
+- 🗺️ **Memory Region & ASLR Inspector:** Automatic categorization of addresses (Static Executable Modules, Shared Libraries, Dynamic Heaps, and Anonymous Proton allocations).
+- 🔎 **Proximity Shadow Scanner:** Automatically inspects the surrounding $\pm 2\text{KB}$ memory window to locate mirrored variables, dual-storage fields, or floating-point representations.
+- 🔒 **Active Freeze & Memory Locking:** Continuous multi-address locking loop re-applies values every frame with live drift tracking and visual status badges.
 - 🛠️ **In-Table Live Editing:** Edit frozen values directly within the active locks table or use the Read/Write panel for targeted offsets.
 - 🔍 **Dynamic Hex Viewer:** Interactive memory inspector with side-by-side hex and ASCII view for nearby structure analysis.
 - 🎮 **Steam / Proton Process Discovery:** Automated detection and filtering of Wine/Steam processes with system service blocklists.
 - 📖 **In-App & CLI Documentation:** Integrated `❓ Help` modal and `--guide` terminal flag.
 - 💻 **Dual Frontends:** Fully featured native GUI (`egui` / `eframe`) and scriptable command-line interface (`clap`).
+
+---
+
+## Validator & Protection Diagnostics
+
+When attempting to modify values in modern games (e.g., *WWE 2K25*, *NBA 2K*, etc.), values may fail to change during in-game purchases or actions. NixGameHax4Steam includes built-in diagnostic monitors and badges:
+
+| Status Badge | Detected Engine Behavior | Explanation & Next Steps |
+| :--- | :--- | :--- |
+| 🟢 **Stable (Local)** | 0% resistance; value holds indefinitely. | Standard local single-player variable. Freezes and direct writes work immediately. |
+| 🟡 **UI Display Cache** | Overwritten rapidly on every render frame (>35% drift). | You have locked a visual HUD/text rendering cache rather than the authoritative variable. Scan during scene changes or trace parent pointers. |
+| 🔴 **Reverted on Action** | Holds while idle, but snaps back upon in-game purchase. | **Server-Side Validation / Shadow Check:** The game validates currency via remote online servers (e.g. 2K Virtual Currency) or dual-storage checksums. Use the **Proximity Shadow Scanner** to find local mirrors. |
+| 🟣 **Dynamic Heap** | Dynamic heap/anonymous allocation. | Address will shift across scene reloads or game restarts (requires base pointer chain). |
 
 ---
 
@@ -73,7 +89,7 @@ cargo run --release --bin nixgamehax4steam -- write <PID> <HEX_ADDRESS> <NEW_VAL
 
 1. **Attach to Game:**
    - Launch your game in Steam (Proton/Wine).
-   - In **NixGameHax4Steam**, type part of the game's executable or name into the **Filter** box.
+   - In **NixGameHax4Steam**, type part of the game's executable or name into the **Filter** box (e.g., `WWE2k25`, `legion`).
    - Select the target process from the dropdown and click **Connect**.
 
 2. **First Scan:**
@@ -86,10 +102,15 @@ cargo run --release --bin nixgamehax4steam -- write <PID> <HEX_ADDRESS> <NEW_VAL
    - Enter the updated value and click **Next Scan**.
    - Repeat until 1–5 candidate addresses remain.
 
-4. **Edit & Freeze:**
+4. **Inspect Diagnostics & Shadow Scan:**
+   - Click any address to inspect its **Memory Region Badge** (Static Module vs. Dynamic Heap).
+   - Click **"🔎 Scan Proximity for Shadows / Dual-Storage"** to locate mirrored variables or float representations within $\pm 2\text{KB}$.
+
+5. **Edit & Freeze:**
    - Click **Lock** on individual rows or **🔒 Lock All** to add addresses to the **Locked Values** table.
    - Double-click or type directly into the **Frozen (edit)** box to change the target value (e.g. `99999`) and press <kbd>Enter</kbd>.
    - Check the **En** checkbox to activate real-time continuous memory freezing.
+   - Monitor the **Validator Status** column to verify if writes are stable or rejected on in-game action.
 
 ---
 
@@ -98,7 +119,7 @@ cargo run --release --bin nixgamehax4steam -- write <PID> <HEX_ADDRESS> <NEW_VAL
 ```
 ┌──────────────────────────────────────────────────────────┐
 │                   GUI Layer (egui / eframe)              │
-│    Process Picker · Scanner · Results · Lock Table · Hex │
+│    Process Picker · Scanner · Diagnostics · Lock Table   │
 └───────────────────────────┬──────────────────────────────┘
                             │ (mpsc Channel & State Machine)
 ┌───────────────────────────▼──────────────────────────────┐
@@ -127,7 +148,7 @@ cargo run --release --bin nixgamehax4steam -- write <PID> <HEX_ADDRESS> <NEW_VAL
 │   ├── lib.rs          # Core library exports
 │   ├── memory.rs       # Memory handle, region map parser, read/write primitives
 │   ├── pid.rs          # Linux process discovery and Wine/Proton hierarchy filtering
-│   ├── gui.rs          # Native egui application frontend & threaded worker
+│   ├── gui.rs          # Native egui application frontend & diagnostic engine
 │   ├── cli.rs          # Command-line interface entry point
 │   └── commands.rs     # CLI command execution handlers
 ├── docs/               # Detailed technical architecture guides
